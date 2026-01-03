@@ -1,8 +1,6 @@
 (async () => {
-
-/* ========== 1. LOAD THƯ VIỆN XLSX ========== */
+/* ========== 1. TẢI THƯ VIỆN XLSX ========== */
 if (!window.XLSX) {
-    console.log("⏳ Đang tải thư viện Excel...");
     await new Promise(r => {
         const s = document.createElement("script");
         s.src = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
@@ -11,38 +9,46 @@ if (!window.XLSX) {
     });
 }
 
-/* ========== 2. HÀM ĐỊNH DẠNG NGÀY (TRƯỜNG DỮ LIỆU GỐC CHUẨN) ========== */
-const parseShopeeDate = (it) => {
-    // Trường dữ liệu chuẩn nhất của Shopee v4: it.info_card.create_time
-    // Fallback nếu không có: it.info_card.order_list_cards[0].product_info.order_create_time
-    let ts = it?.info_card?.create_time 
-          || it?.info_card?.order_list_cards?.[0]?.product_info?.order_create_time 
-          || it?.create_time;
+/* ========== 2. HÀM TÌM NGÀY THÁNG (CƠ CHẾ X-RAY) ========== */
+function extractDate(it) {
+    // Thử lấy từ các trường phổ biến nhất của Shopee 2026
+    let timestamp = it?.info_card?.create_time 
+                 || it?.create_time 
+                 || it?.info_card?.order_list_cards?.[0]?.product_info?.order_create_time
+                 || it?.info_card?.order_list_cards?.[0]?.ctime;
 
-    if (!ts) return "Không rõ ngày";
+    if (!timestamp) return "Không rõ ngày";
 
-    // Shopee dùng giây (10 số), JS dùng mili giây (13 số). Ví dụ: 1735900000 -> 1735900000000
-    const date = new Date(ts < 1e11 ? ts * 1000 : ts);
+    // Chuyển đổi timestamp (10 số sang 13 số nếu cần)
+    let dateObj = new Date(timestamp < 1e12 ? timestamp * 1000 : timestamp);
     
-    if (isNaN(date.getTime())) return "Ngày lỗi";
+    if (isNaN(dateObj.getTime())) return "Lỗi ngày";
 
-    const p = (n) => n.toString().padStart(2, '0');
-    return `${p(date.getDate())}/${p(date.getMonth() + 1)}/${date.getFullYear()} ${p(date.getHours())}:${p(date.getMinutes())}`;
-};
+    const d = dateObj.getDate().toString().padStart(2, '0');
+    const m = (dateObj.getMonth() + 1).toString().padStart(2, '0');
+    const y = dateObj.getFullYear();
+    const h = dateObj.getHours().toString().padStart(2, '0');
+    const min = dateObj.getMinutes().toString().padStart(2, '0');
 
-/* ========== 3. QUY TRÌNH CÀO DỮ LIỆU (CRAWL) ========== */
-async function crawlAll() {
+    return `${d}/${m}/${y} ${h}:${min}`;
+}
+
+/* ========== 3. QUY TRÌNH QUÉT TOÀN BỘ ĐƠN HÀNG ========== */
+async function crawl() {
     let offset = 0;
     const LIMIT = 20;
-    const allOrders = [];
-    const seenKeys = new Set();
+    const orders = [];
+    const seen = new Set();
 
-    // Hiển thị trạng thái đang quét lên màn hình
-    document.body.innerHTML = `<div id="status" style="font-family:Arial;padding:50px;text-align:center;">
-        <h2 style="color:#ee4d2d">🚀 Đang quét toàn bộ đơn hàng...</h2>
-        <p id="count">Đã tìm thấy: 0 đơn hàng</p>
-        <p style="color:#666">Vui lòng không đóng trình duyệt.</p>
-    </div>`;
+    // Hiển thị màn hình chờ hiện đại
+    document.body.innerHTML = `
+        <div id="loader" style="font-family:Arial; text-align:center; padding-top:100px; background:#fff; position:fixed; top:0; left:0; width:100%; height:100%; z-index:9999;">
+            <div style="border: 8px solid #f3f3f3; border-top: 8px solid #ee4d2d; border-radius: 50%; width: 60px; height: 60px; animation: spin 1s linear infinite; margin:auto;"></div>
+            <h2 style="color:#ee4d2d; margin-top:20px;">🚀 ĐANG QUÉT DỮ LIỆU ĐƠN HÀNG...</h2>
+            <p id="progress" style="font-size:18px; color:#555;">Khởi động...</p>
+            <style>@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>
+        </div>
+    `;
 
     while (true) {
         try {
@@ -50,135 +56,127 @@ async function crawlAll() {
             const j = await r.json();
             const list = j?.data?.order_data?.details_list ?? [];
 
-            if (list.length === 0) break; // Hết đơn hàng
+            if (list.length === 0) break;
 
-            for (const it of list) {
-                const info = it.info_card;
+            for (const entry of list) {
+                const info = entry.info_card;
                 if (!info) continue;
 
-                const dateStr = parseShopeeDate(it);
-                const card = info.order_list_cards?.[0];
-                const shop = card?.shop_info?.shop_name ?? "Shopee";
-                const final = (info.final_total ?? 0) / 1e5;
+                const dateStr = extractDate(entry);
+                const cards = info.order_list_cards || [];
 
-                // Chống trùng lặp đơn hàng
-                const key = `${dateStr}_${shop}_${final}`;
-                if (seenKeys.has(key)) continue;
-                seenKeys.add(key);
+                cards.forEach(card => {
+                    const shop = card.shop_info?.shop_name || "Shopee";
+                    const total = (info.final_total ?? 0) / 1e5;
+                    const statusText = {3:"Hoàn thành", 4:"Đã hủy", 7:"Vận chuyển", 8:"Đang giao", 12:"Trả hàng"}[entry.list_type] || "Khác";
 
-                const statusMap = {3:"Hoàn thành",4:"Đã hủy",7:"Vận chuyển",8:"Đang giao",9:"Chờ thanh toán",12:"Trả hàng"};
-                
-                let itemSum = 0;
-                const items = [];
-                card?.product_info?.item_groups?.forEach(g => {
-                    g.items?.forEach(p => {
-                        const price = (p.order_price ?? 0) / 1e5;
-                        itemSum += price;
-                        items.push({ name: p.name, qty: p.amount, total: price });
+                    const products = [];
+                    card.product_info?.item_groups?.forEach(g => {
+                        g.items?.forEach(p => {
+                            products.push({
+                                name: p.name,
+                                qty: p.amount,
+                                price: (p.order_price ?? 0) / 1e5
+                            });
+                        });
                     });
-                });
 
-                allOrders.push({
-                    date: dateStr,
-                    shop,
-                    status: statusMap[it.list_type] || `Khác (${it.list_type})`,
-                    total: final,
-                    itemSum: itemSum,
-                    ship: (info.shipping_fee ?? 0) / 1e5,
-                    isSuccess: [3, 7, 8].includes(it.list_type),
-                    items: items
+                    // Chống trùng (Unique Key)
+                    const key = `${dateStr}_${shop}_${total}`;
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        orders.push({ date: dateStr, shop, total, status: statusText, products, isSuccess: [3,7,8].includes(entry.list_type) });
+                    }
                 });
             }
-
             offset += LIMIT;
-            document.getElementById("count").innerText = `Đã tìm thấy: ${allOrders.length} đơn hàng`;
-            await new Promise(res => setTimeout(res, 400)); // Nghỉ để tránh block IP
-
-        } catch (e) {
-            console.error(e);
-            break;
-        }
+            document.getElementById("progress").innerText = `Đã tìm thấy ${orders.length} đơn hàng...`;
+            await new Promise(res => setTimeout(res, 400));
+        } catch (e) { break; }
     }
-    return allOrders;
+    return orders;
 }
 
-/* ========== 4. GIAO DIỆN WEB (NHƯ BẢN CŨ) ========== */
-function renderWeb(orders) {
-    const totalPaid = orders.filter(o => o.isSuccess).reduce((s, o) => s + o.total, 0);
-    
+/* ========== 4. GIAO DIỆN WEB (DETAILS & TỔNG KẾT) ========== */
+function render(orders) {
+    const totalSpent = orders.filter(o => o.isSuccess).reduce((s, o) => s + o.total, 0);
+
     document.body.innerHTML = `
-        <div style="font-family:Segoe UI,Arial; padding:20px; background:#f4f4f4; color:#333;">
-            <div style="max-width:900px; margin:auto; background:#fff; padding:30px; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.1);">
-                <h2 style="color:#ee4d2d; margin-top:0;">📊 TỔNG KẾT CHI TIÊU SHOPEE</h2>
-                
-                <div style="display:flex; gap:20px; margin-bottom:25px;">
-                    <div style="flex:1; background:#fff5f2; border:1px solid #ffdbd0; padding:20px; border-radius:8px;">
-                        <span style="font-size:14px; color:#666;">Tổng tiền đã thanh toán</span><br>
-                        <b style="font-size:24px; color:#ee4d2d;">${totalPaid.toLocaleString()}đ</b>
+        <div style="font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding:40px; background:#f0f2f5; min-height:100vh;">
+            <div style="max-width:1000px; margin:auto; background:#fff; padding:40px; border-radius:20px; box-shadow:0 10px 40px rgba(0,0,0,0.1);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:30px;">
+                    <h1 style="color:#ee4d2d; margin:0;">🛍️ THỐNG KÊ CHI TIÊU SHOPEE</h1>
+                    <button id="excelBtn" style="background:#26aa99; color:#fff; border:none; padding:12px 25px; border-radius:10px; cursor:pointer; font-weight:bold; font-size:16px;">⬇️ XUẤT FILE EXCEL</button>
+                </div>
+
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-bottom:40px;">
+                    <div style="background:#fff5f2; border:1px solid #ffdbd0; padding:25px; border-radius:15px;">
+                        <span style="color:#666; font-size:14px; text-transform:uppercase; letter-spacing:1px;">Tổng tiền đã thanh toán</span><br>
+                        <b style="font-size:32px; color:#ee4d2d;">${totalSpent.toLocaleString()} VNĐ</b>
                     </div>
-                    <div style="flex:1; background:#f6f6f6; border:1px solid #ddd; padding:20px; border-radius:8px;">
-                        <span style="font-size:14px; color:#666;">Tổng số đơn hàng</span><br>
-                        <b style="font-size:24px;">${orders.length} đơn</b>
+                    <div style="background:#f0f7f6; border:1px solid #d1e7e4; padding:25px; border-radius:15px;">
+                        <span style="color:#666; font-size:14px; text-transform:uppercase; letter-spacing:1px;">Tổng đơn hàng đã mua</span><br>
+                        <b style="font-size:32px; color:#26aa99;">${orders.length} đơn</b>
                     </div>
                 </div>
 
-                <button id="dlBtn" style="width:100%; padding:15px; background:#ee4d2d; color:#fff; border:none; border-radius:6px; font-weight:bold; cursor:pointer; font-size:16px; margin-bottom:30px;">⬇️ TẢI BÁO CÁO EXCEL (.XLSX)</button>
-
-                <h3 style="border-bottom:2px solid #eee; padding-bottom:10px;">Lịch sử chi tiết:</h3>
-                <div id="listContainer"></div>
+                <div id="order-list">
+                    ${orders.map((o, i) => `
+                        <div style="border: 1px solid #eee; border-radius: 12px; margin-bottom: 15px; overflow: hidden; background:#fff;">
+                            <div onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'" 
+                                 style="padding: 18px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; transition: background 0.3s;"
+                                 onmouseover="this.style.background='#fafafa'" onmouseout="this.style.background='#fff'">
+                                <div>
+                                    <span style="color:#888; font-size:12px;">#${i + 1}</span>
+                                    <strong style="display:block; font-size:15px;">${o.date} | ${o.shop}</strong>
+                                </div>
+                                <div style="text-align:right;">
+                                    <strong style="color:#ee4d2d; font-size:16px;">${o.total.toLocaleString()}đ</strong>
+                                    <span style="display:block; font-size:11px; color:#999;">${o.status} ⌵</span>
+                                </div>
+                            </div>
+                            <div style="display:none; padding: 20px; background: #fcfcfc; border-top: 1px solid #eee;">
+                                <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                                    <thead>
+                                        <tr style="text-align: left; color: #777; border-bottom: 1px solid #eee;">
+                                            <th style="padding: 8px 0;">Sản phẩm</th>
+                                            <th style="padding: 8px 0; width: 60px; text-align:center;">SL</th>
+                                            <th style="padding: 8px 0; width: 100px; text-align:right;">Giá</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${o.products.map(p => `
+                                            <tr style="border-bottom: 1px solid #f1f1f1;">
+                                                <td style="padding: 10px 0;">${p.name}</td>
+                                                <td style="padding: 10px 0; text-align:center;">${p.qty}</td>
+                                                <td style="padding: 10px 0; text-align:right;">${p.price.toLocaleString()}đ</td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
             </div>
         </div>
     `;
 
-    const container = document.getElementById("listContainer");
-    orders.forEach((o, i) => {
-        const item = document.createElement("details");
-        item.style.cssText = "margin-bottom:10px; border:1px solid #eee; border-radius:5px; padding:10px;";
-        if (!o.isSuccess) item.style.background = "#fafafa";
-
-        item.innerHTML = `
-            <summary style="cursor:pointer; font-weight:bold; display:flex; justify-content:space-between;">
-                <span>#${i+1}. [${o.date}] - ${o.shop}</span>
-                <span style="color:${o.isSuccess ? '#26aa99' : '#999'}">${o.total.toLocaleString()}đ</span>
-            </summary>
-            <div style="font-size:13px; color:#666; padding-top:10px; border-top:1px solid #f9f9f9; margin-top:10px;">
-                <p>Trạng thái: <b>${o.status}</b></p>
-                <ul style="padding-left:15px;">
-                    ${o.items.map(p => `<li>${p.name} (x${p.qty}) - ${p.total.toLocaleString()}đ</li>`).join('')}
-                </ul>
-            </div>
-        `;
-        container.appendChild(item);
-    });
-
-    document.getElementById("dlBtn").onclick = () => exportExcel(orders);
+    document.getElementById("excelBtn").onclick = () => {
+        const rows = [];
+        orders.forEach((o, idx) => {
+            rows.push({ "STT": idx + 1, "Ngày": o.date, "Shop": o.shop, "Nội dung": "TỔNG ĐƠN", "Tiền": o.total, "Trạng thái": o.status });
+            o.products.forEach(p => rows.push({ "Nội dung": "↳ " + p.name, "Tiền": p.price + " x " + p.qty }));
+        });
+        const ws = XLSX.utils.json_to_sheet(rows);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Shopee");
+        XLSX.writeFile(wb, `Shopee_Report_2026.xlsx`);
+    };
 }
 
-/* ========== 5. XUẤT EXCEL ========== */
-function exportExcel(orders) {
-    const data = [];
-    orders.forEach((o, i) => {
-        data.push({
-            "STT": i + 1,
-            "Ngày đặt": o.date,
-            "Shop": o.shop,
-            "Nội dung": "--- TỔNG ĐƠN ---",
-            "Thực trả": o.total,
-            "Trạng thái": o.status
-        });
-        o.items.forEach(it => {
-            data.push({ "Nội dung": "↳ " + it.name, "Thực trả": it.total });
-        });
-    });
-
-    const ws = XLSX.utils.json_to_sheet(data);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Shopee");
-    XLSX.writeFile(wb, `Shopee_Report_${new Date().getTime()}.xlsx`);
-}
-
-/* ========== RUN ========== */
-const results = await crawlAll();
-renderWeb(results);
+/* ========== KHỞI CHẠY ========== */
+const results = await crawl();
+render(results);
 
 })();
